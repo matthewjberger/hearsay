@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 enum2contract = "0.3"
-nightshade = "0.37.0"
+nightshade = "0.38.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
