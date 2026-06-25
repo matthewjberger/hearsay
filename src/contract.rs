@@ -59,17 +59,20 @@ pub enum PeerEvent {
         payload: Vec<u8>,
         local_only: bool,
     },
+    #[doc(hidden)]
     OpenBridge {
         id: String,
         source_address: String,
         target_address: String,
         ack: bool,
     },
+    #[doc(hidden)]
     CloseBridge {
         id: String,
         target_address: String,
         ack: bool,
     },
+    #[doc(hidden)]
     ForwardText {
         id: String,
         topic: String,
@@ -78,6 +81,7 @@ pub enum PeerEvent {
         visited: Vec<String>,
         sequence: u64,
     },
+    #[doc(hidden)]
     ForwardBinary {
         id: String,
         topic: String,
@@ -92,8 +96,37 @@ pub enum PeerEvent {
 #[serde(default)]
 pub struct Message {
     pub topic: String,
-    pub payload: String,
-    pub bytes: Option<Vec<u8>>,
+    pub body: Body,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub enum Body {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+impl Default for Body {
+    fn default() -> Self {
+        Body::Text(String::new())
+    }
+}
+
+impl Message {
+    /// The text payload, or `None` if this message carries binary data.
+    pub fn text(&self) -> Option<&str> {
+        match &self.body {
+            Body::Text(text) => Some(text),
+            Body::Binary(_) => None,
+        }
+    }
+
+    /// The binary payload, or `None` if this message carries text.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match &self.body {
+            Body::Binary(bytes) => Some(bytes),
+            Body::Text(_) => None,
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

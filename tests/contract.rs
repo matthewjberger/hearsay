@@ -55,13 +55,13 @@ async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
     let _broker = start_broker(broker_address).await?;
     let channel = "all";
 
-    let mut service = create_client("service", test_settings());
-    connect(&mut service, broker_address).await?;
-    subscribe(&mut service, &[&CounterContract::command_topic(channel)]).await?;
+    let service = create_client("service", test_settings());
+    connect(&service, broker_address).await?;
+    subscribe(&service, &[&CounterContract::command_topic(channel)]).await?;
 
-    let mut operator = create_client("operator", test_settings());
-    connect(&mut operator, broker_address).await?;
-    subscribe(&mut operator, &[&CounterContract::event_topic(channel)]).await?;
+    let operator = create_client("operator", test_settings());
+    connect(&operator, broker_address).await?;
+    subscribe(&operator, &[&CounterContract::event_topic(channel)]).await?;
 
     tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -69,11 +69,11 @@ async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
     command_payload.command = CounterCommand::Increment { amount: 5 };
     publish(&operator, &command_topic, &command_payload, Route::Global).await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut service))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&service))
         .await?
         .expect("expected a command message");
     assert_eq!(message.topic, CounterContract::command_topic(channel));
-    let received_command = CommandPayload::from_json(&message.payload)?;
+    let received_command = CommandPayload::from_json(message.text().unwrap())?;
     assert_eq!(
         received_command.command,
         CounterCommand::Increment { amount: 5 }
@@ -86,11 +86,11 @@ async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
     event_payload.event = CounterEvent::Incremented { total: amount };
     publish(&service, &event_topic, &event_payload, Route::Global).await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut operator))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&operator))
         .await?
         .expect("expected an event message");
     assert_eq!(message.topic, CounterContract::event_topic(channel));
-    let received_event = EventPayload::from_json(&message.payload)?;
+    let received_event = EventPayload::from_json(message.text().unwrap())?;
     assert_eq!(received_event.event, CounterEvent::Incremented { total: 5 });
     Ok(())
 }

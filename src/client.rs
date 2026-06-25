@@ -1,5 +1,5 @@
 use crate::{
-    Message, Result, Route,
+    Error, Message, Result, Route,
     contract::PeerEvent,
     wire::{frame_payload, read_frame, serialize_payload},
 };
@@ -19,13 +19,16 @@ use tokio::{
     },
     sync::{
         Mutex, RwLock,
-        mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
+        mpsc::{self, Receiver, Sender, error::TryRecvError},
     },
 };
 
 const RECONNECTION_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_RECONNECTION_BACKOFF: Duration = Duration::from_secs(30);
+const INBOUND_QUEUE_CAPACITY: usize = 1024;
+const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 
-type ReceiverSlot = Arc<Mutex<Option<UnboundedReceiver<Message>>>>;
+type ReceiverSlot = Arc<Mutex<Option<Receiver<Message>>>>;
 
 #[derive(Debug, Clone)]
 pub struct ClientSettings {
@@ -50,6 +53,7 @@ impl Default for ClientSettings {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     state: Arc<RwLock<ClientState>>,
     settings: ClientSettings,
@@ -57,7 +61,7 @@ pub struct Client {
 
 struct ClientState {
     id: String,
-    writer: Option<OwnedWriteHalf>,
+    outbound: Option<Sender<Vec<u8>>>,
     receiver: ReceiverSlot,
     subscriptions: HashSet<String>,
     pending_subscriptions: HashSet<String>,
@@ -72,7 +76,7 @@ pub fn create_client(name: &str, settings: ClientSettings) -> Client {
     Client {
         state: Arc::new(RwLock::new(ClientState {
             id,
-            writer: None,
+            outbound: None,
             receiver: Arc::new(Mutex::new(None)),
             subscriptions: HashSet::new(),
             pending_subscriptions: HashSet::new(),
@@ -88,14 +92,14 @@ pub async fn client_id(client: &Client) -> String {
     client.state.read().await.id.clone()
 }
 
-pub async fn assign_client_id(client: &mut Client, id: &str) {
+pub(crate) async fn assign_client_id(client: &Client, id: &str) {
     client.state.write().await.id = id.to_string();
 }
 
 pub async fn is_connected(client: &Client) -> bool {
     let receiver_slot = {
         let state = client.state.read().await;
-        if state.writer.is_none() {
+        if state.outbound.is_none() {
             return false;
         }
         state.receiver.clone()
@@ -110,7 +114,11 @@ pub async fn subscriptions(client: &Client) -> HashSet<String> {
     client.state.read().await.subscriptions.clone()
 }
 
-pub async fn connect(client: &mut Client, address: &str) -> Result<()> {
+/// Connects to a broker. With `autoreconnect` enabled the client also
+/// re-establishes the connection if it later drops and re-sends its
+/// subscriptions, but it does not replay messages published to those topics
+/// while it was disconnected; any such messages are lost.
+pub async fn connect(client: &Client, address: &str) -> Result<()> {
     client.state.write().await.broker_address = Some(address.to_string());
     establish_connection(
         &client.state,
@@ -135,7 +143,7 @@ pub async fn connect(client: &mut Client, address: &str) -> Result<()> {
 
 pub async fn publish(
     client: &Client,
-    topic: &str,
+    topic: impl AsRef<str>,
     payload: &impl Serialize,
     route: Route,
 ) -> Result<()> {
@@ -143,31 +151,34 @@ pub async fn publish(
     publish_json(client, topic, &payload_json, route).await
 }
 
-pub async fn publish_json(client: &Client, topic: &str, payload: &str, route: Route) -> Result<()> {
-    let mut state = client.state.write().await;
+pub async fn publish_json(
+    client: &Client,
+    topic: impl AsRef<str>,
+    payload: &str,
+    route: Route,
+) -> Result<()> {
     let publish_event = PeerEvent::PublishText {
-        id: state.id.clone(),
-        topic: topic.to_string(),
+        id: client.state.read().await.id.clone(),
+        topic: topic.as_ref().to_string(),
         payload: payload.to_string(),
         local_only: matches!(route, Route::Local),
     };
-    notify_broker(&mut state, &publish_event).await
+    send_event(&client.state, &publish_event).await
 }
 
 pub async fn publish_bytes(
     client: &Client,
-    topic: &str,
+    topic: impl AsRef<str>,
     payload: &[u8],
     route: Route,
 ) -> Result<()> {
-    let mut state = client.state.write().await;
     let publish_event = PeerEvent::PublishBinary {
-        id: state.id.clone(),
-        topic: topic.to_string(),
+        id: client.state.read().await.id.clone(),
+        topic: topic.as_ref().to_string(),
         payload: payload.to_vec(),
         local_only: matches!(route, Route::Local),
     };
-    notify_broker(&mut state, &publish_event).await
+    send_event(&client.state, &publish_event).await
 }
 
 pub(crate) async fn forward_text(
@@ -177,16 +188,15 @@ pub(crate) async fn forward_text(
     visited: Vec<String>,
     sequence: u64,
 ) -> Result<()> {
-    let mut state = client.state.write().await;
     let forward_event = PeerEvent::ForwardText {
-        id: state.id.clone(),
+        id: client.state.read().await.id.clone(),
         topic: topic.to_string(),
         payload: payload.to_string(),
         local_only: false,
         visited,
         sequence,
     };
-    notify_broker(&mut state, &forward_event).await
+    send_event(&client.state, &forward_event).await
 }
 
 pub(crate) async fn forward_bytes(
@@ -196,67 +206,106 @@ pub(crate) async fn forward_bytes(
     visited: Vec<String>,
     sequence: u64,
 ) -> Result<()> {
-    let mut state = client.state.write().await;
     let forward_event = PeerEvent::ForwardBinary {
-        id: state.id.clone(),
+        id: client.state.read().await.id.clone(),
         topic: topic.to_string(),
         payload: payload.to_vec(),
         local_only: false,
         visited,
         sequence,
     };
-    notify_broker(&mut state, &forward_event).await
+    send_event(&client.state, &forward_event).await
 }
 
-pub async fn subscribe(client: &mut Client, topics: &[&str]) -> Result<()> {
-    let mut state = client.state.write().await;
+pub async fn subscribe(client: &Client, topics: &[impl AsRef<str>]) -> Result<()> {
     for topic in topics {
-        if state.writer.is_none() {
-            state.pending_subscriptions.insert((*topic).to_string());
+        let topic = topic.as_ref();
+        let event = {
+            let mut state = client.state.write().await;
+            if state.outbound.is_none() {
+                state.pending_subscriptions.insert(topic.to_string());
+                None
+            } else {
+                Some(PeerEvent::Subscribe {
+                    id: state.id.clone(),
+                    topic: topic.to_string(),
+                })
+            }
+        };
+        let Some(event) = event else {
             continue;
-        }
-        if let Err(error) = create_subscription(&mut state, topic).await {
-            state.pending_subscriptions.insert((*topic).to_string());
+        };
+        if let Err(error) = send_event(&client.state, &event).await {
+            client
+                .state
+                .write()
+                .await
+                .pending_subscriptions
+                .insert(topic.to_string());
             return Err(error);
         }
+        client
+            .state
+            .write()
+            .await
+            .subscriptions
+            .insert(topic.to_string());
     }
     Ok(())
 }
 
-pub async fn unsubscribe(client: &mut Client, topics: &[&str]) -> Result<()> {
-    let mut state = client.state.write().await;
+pub async fn unsubscribe(client: &Client, topics: &[impl AsRef<str>]) -> Result<()> {
     for topic in topics {
-        state.pending_subscriptions.remove(*topic);
-        state.subscriptions.remove(*topic);
-        if state.writer.is_none() {
-            continue;
-        }
-        let unsubscribe_event = PeerEvent::Unsubscribe {
-            id: state.id.clone(),
-            topic: (*topic).to_string(),
+        let topic = topic.as_ref();
+        let event = {
+            let mut state = client.state.write().await;
+            state.pending_subscriptions.remove(topic);
+            state.subscriptions.remove(topic);
+            if state.outbound.is_none() {
+                None
+            } else {
+                Some(PeerEvent::Unsubscribe {
+                    id: state.id.clone(),
+                    topic: topic.to_string(),
+                })
+            }
         };
-        notify_broker(&mut state, &unsubscribe_event).await?;
+        if let Some(event) = event {
+            send_event(&client.state, &event).await?;
+        }
     }
     Ok(())
 }
 
-pub async fn try_next_message(client: &mut Client) -> Option<Message> {
+/// Result of a non-blocking [`try_next_message`]: a message is available, the
+/// queue is currently empty but the client is still connected, or the client
+/// has disconnected and no further messages will arrive until reconnection.
+#[derive(Debug)]
+pub enum Reception {
+    Message(Message),
+    Empty,
+    Disconnected,
+}
+
+pub async fn try_next_message(client: &Client) -> Reception {
     let receiver_slot = client.state.read().await.receiver.clone();
     let mut receiver_guard = receiver_slot.lock().await;
-    let receiver = receiver_guard.as_mut()?;
+    let Some(receiver) = receiver_guard.as_mut() else {
+        return Reception::Disconnected;
+    };
     match receiver.try_recv() {
-        Ok(message) => Some(message),
+        Ok(message) => Reception::Message(message),
         Err(TryRecvError::Disconnected) => {
             *receiver_guard = None;
             drop(receiver_guard);
-            client.state.write().await.writer = None;
-            None
+            client.state.write().await.outbound = None;
+            Reception::Disconnected
         }
-        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Empty) => Reception::Empty,
     }
 }
 
-pub async fn next_message(client: &mut Client) -> Option<Message> {
+pub async fn next_message(client: &Client) -> Option<Message> {
     let receiver_slot = client.state.read().await.receiver.clone();
     let mut receiver_guard = receiver_slot.lock().await;
     let receiver = receiver_guard.as_mut()?;
@@ -266,7 +315,7 @@ pub async fn next_message(client: &mut Client) -> Option<Message> {
         None => {
             *receiver_guard = None;
             drop(receiver_guard);
-            client.state.write().await.writer = None;
+            client.state.write().await.outbound = None;
             None
         }
     }
@@ -276,36 +325,41 @@ pub async fn open_bridge(
     client: &Client,
     source_address: &str,
     target_address: &str,
+) -> Result<()> {
+    open_bridge_acked(client, source_address, target_address, false).await
+}
+
+pub(crate) async fn open_bridge_acked(
+    client: &Client,
+    source_address: &str,
+    target_address: &str,
     ack: bool,
 ) -> Result<()> {
-    let mut state = client.state.write().await;
     let bridge_event = PeerEvent::OpenBridge {
-        id: state.id.clone(),
+        id: client.state.read().await.id.clone(),
         source_address: source_address.to_string(),
         target_address: target_address.to_string(),
         ack,
     };
-    notify_broker(&mut state, &bridge_event).await
+    send_event(&client.state, &bridge_event).await
 }
 
-pub async fn close_bridge(client: &Client, target_address: &str, ack: bool) -> Result<()> {
-    let mut state = client.state.write().await;
+pub async fn close_bridge(client: &Client, target_address: &str) -> Result<()> {
     let close_event = PeerEvent::CloseBridge {
         id: String::new(),
         target_address: target_address.to_string(),
-        ack,
+        ack: false,
     };
-    notify_broker(&mut state, &close_event).await
+    send_event(&client.state, &close_event).await
 }
 
 pub(crate) async fn notify_close_bridge(client: &Client, id: &str) -> Result<()> {
-    let mut state = client.state.write().await;
     let close_event = PeerEvent::CloseBridge {
         id: id.to_string(),
         target_address: String::new(),
         ack: true,
     };
-    notify_broker(&mut state, &close_event).await
+    send_event(&client.state, &close_event).await
 }
 
 async fn establish_connection(
@@ -317,19 +371,19 @@ async fn establish_connection(
     let stream =
         connect_with_retries(address, max_connection_attempts, timeout_per_attempt).await?;
     let (read_half, write_half) = stream.into_split();
-    let (message_sender, message_receiver) = mpsc::unbounded_channel();
-    let receiver_slot = {
+    let (message_sender, message_receiver) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
+    let (outbound_sender, outbound_receiver) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+    let (id, read_timeout, receiver_slot) = {
         let mut guard = state.write().await;
-        guard.writer = Some(write_half);
-        tokio::spawn(read_task(read_half, message_sender, guard.read_timeout));
-        let hello_event = PeerEvent::Hello {
-            id: guard.id.clone(),
-        };
-        notify_broker(&mut guard, &hello_event).await?;
-        resubscribe(&mut guard).await?;
-        guard.receiver.clone()
+        guard.outbound = Some(outbound_sender);
+        (guard.id.clone(), guard.read_timeout, guard.receiver.clone())
     };
+    tokio::spawn(writer_task(write_half, outbound_receiver));
+    tokio::spawn(read_task(read_half, message_sender, read_timeout));
     *receiver_slot.lock().await = Some(message_receiver);
+    let hello_event = PeerEvent::Hello { id };
+    send_event(state, &hello_event).await?;
+    resubscribe(state).await?;
     Ok(())
 }
 
@@ -338,16 +392,18 @@ async fn reconnection_task(
     max_connection_attempts: Option<u16>,
     timeout_per_attempt: Duration,
 ) {
+    let mut backoff = RECONNECTION_INTERVAL;
     loop {
-        tokio::time::sleep(RECONNECTION_INTERVAL).await;
+        tokio::time::sleep(backoff).await;
         let Some(state_handle) = state.upgrade() else {
             break;
         };
         let (connected, address) = {
             let guard = state_handle.read().await;
-            (guard.writer.is_some(), guard.broker_address.clone())
+            (guard.outbound.is_some(), guard.broker_address.clone())
         };
         if connected {
+            backoff = RECONNECTION_INTERVAL;
             continue;
         }
         let Some(address) = address else {
@@ -360,6 +416,7 @@ async fn reconnection_task(
             timeout_per_attempt,
         )
         .await;
+        backoff = (backoff * 2).min(MAX_RECONNECTION_BACKOFF);
     }
 }
 
@@ -378,7 +435,7 @@ async fn connect_with_retries(
         if let Some(max_attempts) = max_connection_attempts
             && attempt >= max_attempts
         {
-            return Err("maximum connection attempts reached".into());
+            return Err(Error::MaxConnectionAttempts);
         }
         attempt += 1;
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -389,14 +446,14 @@ pub(crate) async fn resolve_addresses(address: &str) -> Result<Vec<SocketAddr>> 
     let mut addresses: Vec<SocketAddr> = tokio::net::lookup_host(address).await?.collect();
     addresses.sort_by_key(|resolved| !resolved.is_ipv4());
     if addresses.is_empty() {
-        return Err("could not resolve address".into());
+        return Err(Error::AddressResolution);
     }
     Ok(addresses)
 }
 
 async fn create_tcp_connection(address: &str) -> Result<TcpStream> {
     let addresses = resolve_addresses(address).await?;
-    let mut last_error: crate::Error = "could not resolve address".into();
+    let mut last_error: crate::Error = Error::AddressResolution;
     for socket_address in addresses {
         match TcpStream::connect(socket_address).await {
             Ok(stream) => {
@@ -422,7 +479,7 @@ fn configure_keepalive(stream: &TcpStream) -> Result<()> {
 
 async fn read_task(
     mut read_half: OwnedReadHalf,
-    message_sender: UnboundedSender<Message>,
+    message_sender: Sender<Message>,
     read_timeout: Option<Duration>,
 ) {
     loop {
@@ -440,40 +497,52 @@ async fn read_task(
                 Err(_) => break,
             },
         };
-        if message_sender.send(message).is_err() {
+        if message_sender.send(message).await.is_err() {
             break;
         }
     }
 }
 
-async fn notify_broker(state: &mut ClientState, event: &PeerEvent) -> Result<()> {
+async fn writer_task(mut write_half: OwnedWriteHalf, mut outbound: Receiver<Vec<u8>>) {
+    while let Some(frame) = outbound.recv().await {
+        if write_half.write_all(&frame).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn send_event(state: &Arc<RwLock<ClientState>>, event: &PeerEvent) -> Result<()> {
     let frame = frame_payload(&serialize_payload(event)?);
-    let Some(writer) = state.writer.as_mut() else {
-        return Err("client is not connected".into());
+    let outbound = state.read().await.outbound.clone();
+    let Some(outbound) = outbound else {
+        return Err(Error::NotConnected);
     };
-    if let Err(error) = writer.write_all(&frame).await {
-        state.writer = None;
-        return Err(error.into());
+    if outbound.send(frame).await.is_err() {
+        state.write().await.outbound = None;
+        return Err(Error::NotConnected);
     }
     Ok(())
 }
 
-async fn resubscribe(state: &mut ClientState) -> Result<()> {
-    let mut topics: HashSet<String> = state.subscriptions.iter().cloned().collect();
-    topics.extend(state.pending_subscriptions.iter().cloned());
+async fn resubscribe(state: &Arc<RwLock<ClientState>>) -> Result<()> {
+    let topics: HashSet<String> = {
+        let guard = state.read().await;
+        guard
+            .subscriptions
+            .iter()
+            .cloned()
+            .chain(guard.pending_subscriptions.iter().cloned())
+            .collect()
+    };
     for topic in topics {
-        create_subscription(state, &topic).await?;
-        state.pending_subscriptions.remove(&topic);
+        let subscribe_event = PeerEvent::Subscribe {
+            id: state.read().await.id.clone(),
+            topic: topic.clone(),
+        };
+        send_event(state, &subscribe_event).await?;
+        let mut guard = state.write().await;
+        guard.subscriptions.insert(topic.clone());
+        guard.pending_subscriptions.remove(&topic);
     }
-    Ok(())
-}
-
-async fn create_subscription(state: &mut ClientState, topic: &str) -> Result<()> {
-    let subscribe_event = PeerEvent::Subscribe {
-        id: state.id.clone(),
-        topic: topic.to_string(),
-    };
-    notify_broker(state, &subscribe_event).await?;
-    state.subscriptions.insert(topic.to_string());
     Ok(())
 }

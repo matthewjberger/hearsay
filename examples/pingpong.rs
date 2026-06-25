@@ -53,19 +53,16 @@ pub enum PingPongEvent {
 struct Responder;
 
 impl Lifecycle for Responder {
-    async fn initialize(&mut self, client: &mut Client) {
+    async fn initialize(&mut self, client: &Client) {
         let topic = PingPongContract::command_topic(PingPongContract::BROADCAST);
         let _ = subscribe(client, &[&topic]).await;
     }
 
-    async fn receive_message(
-        &mut self,
-        message: &Message,
-        client: &mut Client,
-    ) -> Option<Interrupt> {
+    async fn receive_message(&mut self, message: &Message, client: &Client) -> Option<Interrupt> {
         match message.topic.as_str() {
             topic if PingPongContract::command_topic(PingPongContract::BROADCAST) == topic => {
-                let Ok(payload) = CommandPayload::from_json(&message.payload) else {
+                let Ok(payload) = CommandPayload::from_json(message.text().unwrap_or_default())
+                else {
                     return None;
                 };
                 if matches!(payload.command, PingPongCommand::Ping) {
@@ -149,10 +146,10 @@ async fn run_broker() -> hearsay::Result<()> {
 }
 
 async fn run_requester() -> hearsay::Result<()> {
-    let mut requester = create_client("requester", ClientSettings::default());
-    connect(&mut requester, BROKER_ADDRESS).await?;
+    let requester = create_client("requester", ClientSettings::default());
+    connect(&requester, BROKER_ADDRESS).await?;
     subscribe(
-        &mut requester,
+        &requester,
         &[&PingPongContract::event_topic(PingPongContract::BROADCAST)],
     )
     .await?;
@@ -164,14 +161,14 @@ async fn run_requester() -> hearsay::Result<()> {
         publish(&requester, &command_topic, &command_payload, Route::Global).await?;
 
         let received =
-            tokio::time::timeout(Duration::from_millis(100), next_message(&mut requester)).await;
+            tokio::time::timeout(Duration::from_millis(100), next_message(&requester)).await;
         let Ok(Some(message)) = received else {
             continue;
         };
         if message.topic != PingPongContract::event_topic(PingPongContract::BROADCAST) {
             continue;
         }
-        let Ok(event_payload) = EventPayload::from_json(&message.payload) else {
+        let Ok(event_payload) = EventPayload::from_json(message.text().unwrap_or_default()) else {
             continue;
         };
         if let PingPongEvent::Pong { value } = event_payload.event {

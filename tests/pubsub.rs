@@ -23,14 +23,14 @@ async fn round_trip() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9931";
     let _broker = start_broker(broker_address).await?;
 
-    let mut subscriber = create_client("subscriber", test_settings());
-    connect(&mut subscriber, broker_address).await?;
+    let subscriber = create_client("subscriber", test_settings());
+    connect(&subscriber, broker_address).await?;
 
-    let mut publisher = create_client("publisher", test_settings());
-    connect(&mut publisher, broker_address).await?;
+    let publisher = create_client("publisher", test_settings());
+    connect(&publisher, broker_address).await?;
 
     let topic = "test/data";
-    subscribe(&mut subscriber, &[topic]).await?;
+    subscribe(&subscriber, &[topic]).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let payload = TestPayload {
@@ -39,11 +39,11 @@ async fn round_trip() -> hearsay::Result<()> {
     };
     publish(&publisher, topic, &payload, Route::Global).await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut subscriber))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a message");
     assert_eq!(message.topic, topic);
-    let received: TestPayload = serde_json::from_str(&message.payload)?;
+    let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
     assert_eq!(received, payload);
     Ok(())
 }
@@ -53,24 +53,24 @@ async fn binary_round_trip() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9932";
     let _broker = start_broker(broker_address).await?;
 
-    let mut subscriber = create_client("subscriber", test_settings());
-    connect(&mut subscriber, broker_address).await?;
+    let subscriber = create_client("subscriber", test_settings());
+    connect(&subscriber, broker_address).await?;
 
-    let mut publisher = create_client("publisher", test_settings());
-    connect(&mut publisher, broker_address).await?;
+    let publisher = create_client("publisher", test_settings());
+    connect(&publisher, broker_address).await?;
 
     let topic = "test/binary";
-    subscribe(&mut subscriber, &[topic]).await?;
+    subscribe(&subscriber, &[topic]).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let payload = vec![1_u8, 2, 3, 4, 5];
     publish_bytes(&publisher, topic, &payload, Route::Global).await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut subscriber))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a message");
     assert_eq!(message.topic, topic);
-    assert_eq!(message.bytes, Some(payload));
+    assert_eq!(message.bytes(), Some(payload.as_slice()));
     Ok(())
 }
 
@@ -79,9 +79,9 @@ async fn stopped_broker_shuts_down_and_disconnects_peers() -> hearsay::Result<()
     let broker_address = "127.0.0.1:9948";
     let broker = start_broker(broker_address).await?;
 
-    let mut subscriber = create_client("subscriber", test_settings());
-    connect(&mut subscriber, broker_address).await?;
-    subscribe(&mut subscriber, &["test/shutdown"]).await?;
+    let subscriber = create_client("subscriber", test_settings());
+    connect(&subscriber, broker_address).await?;
+    subscribe(&subscriber, &["test/shutdown"]).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     assert!(broker_is_running(&broker));
@@ -89,8 +89,7 @@ async fn stopped_broker_shuts_down_and_disconnects_peers() -> hearsay::Result<()
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!broker_is_running(&broker));
 
-    let message =
-        tokio::time::timeout(Duration::from_secs(5), next_message(&mut subscriber)).await?;
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber)).await?;
     assert!(message.is_none());
     Ok(())
 }
@@ -99,12 +98,12 @@ async fn stopped_broker_shuts_down_and_disconnects_peers() -> hearsay::Result<()
 async fn localhost_binds_loopback() -> hearsay::Result<()> {
     let _broker = start_broker("localhost:9949").await?;
 
-    let mut subscriber = create_client("subscriber", test_settings());
-    connect(&mut subscriber, "localhost:9949").await?;
-    subscribe(&mut subscriber, &["test/localhost"]).await?;
+    let subscriber = create_client("subscriber", test_settings());
+    connect(&subscriber, "localhost:9949").await?;
+    subscribe(&subscriber, &["test/localhost"]).await?;
 
-    let mut publisher = create_client("publisher", test_settings());
-    connect(&mut publisher, "127.0.0.1:9949").await?;
+    let publisher = create_client("publisher", test_settings());
+    connect(&publisher, "127.0.0.1:9949").await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let payload = TestPayload {
@@ -113,7 +112,7 @@ async fn localhost_binds_loopback() -> hearsay::Result<()> {
     };
     publish(&publisher, "test/localhost", &payload, Route::Global).await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut subscriber))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a message");
     assert_eq!(message.topic, "test/localhost");
@@ -126,17 +125,17 @@ async fn offline_unsubscribe_does_not_resurrect_on_reconnect() -> hearsay::Resul
     let topic = "test/resurrect";
     let broker = start_broker(broker_address).await?;
 
-    let mut subscriber = create_client("subscriber", ClientSettings::default());
-    connect(&mut subscriber, broker_address).await?;
-    subscribe(&mut subscriber, &[topic]).await?;
+    let subscriber = create_client("subscriber", ClientSettings::default());
+    connect(&subscriber, broker_address).await?;
+    subscribe(&subscriber, &[topic]).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     stop_broker(&broker);
     drop(broker);
-    while next_message(&mut subscriber).await.is_some() {}
+    while next_message(&subscriber).await.is_some() {}
     assert!(!is_connected(&subscriber).await);
 
-    unsubscribe(&mut subscriber, &[topic]).await?;
+    unsubscribe(&subscriber, &[topic]).await?;
 
     let _broker = start_broker(broker_address).await?;
     while !is_connected(&subscriber).await {
@@ -144,8 +143,8 @@ async fn offline_unsubscribe_does_not_resurrect_on_reconnect() -> hearsay::Resul
     }
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let mut publisher = create_client("publisher", test_settings());
-    connect(&mut publisher, broker_address).await?;
+    let publisher = create_client("publisher", test_settings());
+    connect(&publisher, broker_address).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let payload = TestPayload {
@@ -154,7 +153,7 @@ async fn offline_unsubscribe_does_not_resurrect_on_reconnect() -> hearsay::Resul
     };
     publish(&publisher, topic, &payload, Route::Global).await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(2), next_message(&mut subscriber)).await;
+    let message = tokio::time::timeout(Duration::from_secs(2), next_message(&subscriber)).await;
     assert!(message.is_err());
     Ok(())
 }
@@ -165,12 +164,12 @@ async fn pending_subscriptions_apply_on_connect() -> hearsay::Result<()> {
     let _broker = start_broker(broker_address).await?;
 
     let topic = "test/pending";
-    let mut subscriber = create_client("subscriber", test_settings());
-    subscribe(&mut subscriber, &[topic]).await?;
-    connect(&mut subscriber, broker_address).await?;
+    let subscriber = create_client("subscriber", test_settings());
+    subscribe(&subscriber, &[topic]).await?;
+    connect(&subscriber, broker_address).await?;
 
-    let mut publisher = create_client("publisher", test_settings());
-    connect(&mut publisher, broker_address).await?;
+    let publisher = create_client("publisher", test_settings());
+    connect(&publisher, broker_address).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let payload = TestPayload {
@@ -179,7 +178,7 @@ async fn pending_subscriptions_apply_on_connect() -> hearsay::Result<()> {
     };
     publish(&publisher, topic, &payload, Route::Global).await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut subscriber))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a message");
     assert_eq!(message.topic, topic);

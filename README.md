@@ -14,7 +14,7 @@
 
 hearsay is topic-based pub/sub for Rust, built on [tokio](https://tokio.rs). One process hosts the broker with a single call; any number of others connect and exchange JSON or binary messages over TCP. The broker is a value your program holds, not a separate server to run.
 
-- **Typed contracts**: message schemas are strongly typed enums via [enum2contract](https://github.com/matthewjberger/enum2contract), re-exported so contracts need no extra dependency
+- **Typed contracts**: message schemas are strongly typed enums via [enum2contract](https://github.com/matthewjberger/enum2contract), re-exported so contracts need no extra dependency. Topics accept any `AsRef<str>`, but naming them through a contract's generated topic accessors (for example `MyContract::event_topic(channel)`) keeps topic strings checked at compile time instead of scattered as literals
 - **Bridging**: brokers connect to each other
 - **WebSockets**: browser and WASM apps join the same bus
 - **Spawning**: the broker can own, supervise, and restart its client processes
@@ -31,16 +31,20 @@ let broker = hearsay::start_broker("127.0.0.1:9612").await?;
 Any other program connects to it as a client:
 
 ```rust
-let mut client = hearsay::create_client("listener", hearsay::ClientSettings::default());
-hearsay::connect(&mut client, "127.0.0.1:9612").await?;
-hearsay::subscribe(&mut client, &["greetings"]).await?;
+let client = hearsay::create_client("listener", hearsay::ClientSettings::default());
+hearsay::connect(&client, "127.0.0.1:9612").await?;
+hearsay::subscribe(&client, &["greetings"]).await?;
 
 hearsay::publish(&client, "greetings", &"hello".to_string(), hearsay::Route::Global).await?;
 
-if let Some(message) = hearsay::next_message(&mut client).await {
-    println!("{}", message.payload);
+if let Some(message) = hearsay::next_message(&client).await {
+    if let Some(text) = message.text() {
+        println!("{text}");
+    }
 }
 ```
+
+A `Client` is cheap to clone and every operation takes `&Client`, so the same connection can be shared across tasks.
 
 The bus runs for as long as the `Broker` is held; `stop_broker` (or dropping it) shuts everything down.
 
@@ -105,7 +109,7 @@ let updates: Vec<EntityUpdate> = hearsay::read_batch(&message)?;
 
 Delivery is best-effort: there are no acknowledgements and no replay, so a message published while a subscriber is disconnected is gone. Each subscriber has two bounded queues at the broker: a control queue for the broker's own coordination messages (the `hearsay/` topics: peer connections, introspection reports, bridge events) and a data queue for everything else. High-frequency application data that outruns a subscriber is dropped from the data queue, the conventional best-effort behavior. Control messages are never silently dropped; if a subscriber is so stalled that even its low-volume control queue fills, the broker disconnects it, and with `autoreconnect` (the default) the client reconnects and re-subscribes rather than carrying a silent gap in coordination state.
 
-Across bridges, each message is forwarded with the set of brokers it has already traversed and a per-origin sequence number. A broker drops a message whose path already includes itself, which guarantees forwarding terminates on any topology including cycles. Each broker tracks a per-origin high-water mark, so a given message is delivered at most once no matter how many redundant paths carry it to that broker; the only state bounded for safety is the number of distinct origins tracked, evicted least-recently-seen first.
+Across bridges, each message is forwarded with the set of brokers it has already traversed and a per-origin sequence number. A broker drops a message whose path already includes itself, which guarantees forwarding terminates on any topology including cycles. Each broker tracks a per-origin high-water mark, so a given message is delivered at most once no matter how many redundant paths carry it to that broker; the only state bounded for safety is the number of distinct origins tracked, evicted least-recently-seen first. The reorder window is likewise bounded, so a single message delayed behind a very large number of newer ones from the same origin may be dropped rather than delivered late, which is consistent with the best-effort contract.
 
 ## Example
 

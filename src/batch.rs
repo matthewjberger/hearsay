@@ -60,7 +60,7 @@ pub async fn flush_batch<T: Serialize>(client: &Client, batch: &mut Batch<T>) ->
 }
 
 pub fn read_batch<T: DeserializeOwned>(message: &Message) -> Result<Vec<T>> {
-    let Some(bytes) = message.bytes.as_ref() else {
+    let Some(bytes) = message.bytes() else {
         return Err("message has no binary payload".into());
     };
     Ok(postcard::from_bytes(bytes)?)

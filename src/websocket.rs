@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    broker::{Broker, BrokerEvent, PeerWriter, forward_peer_event, resolve_address},
+    broker::{Broker, BrokerEvent, PeerWriter, WebSocketSink, forward_peer_event, resolve_address},
     contract::PeerEvent,
 };
 use futures_util::StreamExt;
@@ -44,7 +44,7 @@ async fn websocket_connection_task(event_sender: Sender<BrokerEvent>, stream: Tc
         return;
     };
     let (sink, mut messages) = websocket.split();
-    let mut writer = Some(PeerWriter::WebSocket(sink));
+    let mut writer: Option<PeerWriter> = Some(Box::new(WebSocketSink(sink)));
     let mut shutdown_signal = None;
     while let Some(Ok(message)) = messages.next().await {
         let event = match message {

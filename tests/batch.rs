@@ -31,11 +31,11 @@ fn sample_updates(count: u64) -> Vec<EntityUpdate> {
 async fn batch_flushes_at_max_items() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9945";
     let _broker = start_broker(broker_address).await?;
-    let mut subscriber = create_client("subscriber", test_settings());
-    connect(&mut subscriber, broker_address).await?;
-    subscribe(&mut subscriber, &["updates/size"]).await?;
-    let mut publisher = create_client("publisher", test_settings());
-    connect(&mut publisher, broker_address).await?;
+    let subscriber = create_client("subscriber", test_settings());
+    connect(&subscriber, broker_address).await?;
+    subscribe(&subscriber, &["updates/size"]).await?;
+    let publisher = create_client("publisher", test_settings());
+    connect(&publisher, broker_address).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut batch = create_batch("updates/size", Route::Global, 3, Duration::from_secs(60));
@@ -44,7 +44,7 @@ async fn batch_flushes_at_max_items() -> hearsay::Result<()> {
     }
     assert!(batch.items.is_empty());
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut subscriber))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a batch message");
     assert_eq!(message.topic, "updates/size");
@@ -57,11 +57,11 @@ async fn batch_flushes_at_max_items() -> hearsay::Result<()> {
 async fn batch_flushes_after_interval() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9946";
     let _broker = start_broker(broker_address).await?;
-    let mut subscriber = create_client("subscriber", test_settings());
-    connect(&mut subscriber, broker_address).await?;
-    subscribe(&mut subscriber, &["updates/interval"]).await?;
-    let mut publisher = create_client("publisher", test_settings());
-    connect(&mut publisher, broker_address).await?;
+    let subscriber = create_client("subscriber", test_settings());
+    connect(&subscriber, broker_address).await?;
+    subscribe(&subscriber, &["updates/interval"]).await?;
+    let publisher = create_client("publisher", test_settings());
+    connect(&publisher, broker_address).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut batch = create_batch(
@@ -77,7 +77,7 @@ async fn batch_flushes_after_interval() -> hearsay::Result<()> {
     push_to_batch(&publisher, &mut batch, sample_updates(2)[1].clone()).await?;
     assert!(batch.items.is_empty());
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut subscriber))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a batch message");
     let updates: Vec<EntityUpdate> = read_batch(&message)?;
@@ -89,11 +89,11 @@ async fn batch_flushes_after_interval() -> hearsay::Result<()> {
 async fn manual_flush_sends_pending_items() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9947";
     let _broker = start_broker(broker_address).await?;
-    let mut subscriber = create_client("subscriber", test_settings());
-    connect(&mut subscriber, broker_address).await?;
-    subscribe(&mut subscriber, &["updates/manual"]).await?;
-    let mut publisher = create_client("publisher", test_settings());
-    connect(&mut publisher, broker_address).await?;
+    let subscriber = create_client("subscriber", test_settings());
+    connect(&subscriber, broker_address).await?;
+    subscribe(&subscriber, &["updates/manual"]).await?;
+    let publisher = create_client("publisher", test_settings());
+    connect(&publisher, broker_address).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut batch = create_batch(
@@ -109,7 +109,7 @@ async fn manual_flush_sends_pending_items() -> hearsay::Result<()> {
     flush_batch(&publisher, &mut batch).await?;
     assert!(batch.items.is_empty());
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut subscriber))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a batch message");
     let updates: Vec<EntityUpdate> = read_batch(&message)?;

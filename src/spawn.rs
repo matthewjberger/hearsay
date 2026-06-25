@@ -1,4 +1,4 @@
-use crate::{Broker, Result};
+use crate::{Broker, Error, Result};
 use std::{
     collections::HashMap,
     process::Stdio,
@@ -96,7 +96,7 @@ pub async fn spawn_app(broker: &Broker, app: App) -> Result<()> {
     if let Some(managed) = state.apps.get_mut(&app.name)
         && matches!(poll_status(managed), AppStatus::Running)
     {
-        return Err(format!("app '{}' is already running", app.name).into());
+        return Err(Error::AppAlreadyRunning(app.name.clone()));
     }
     let child = launch(&app, &state.broker_address, &state.output_sender)?;
     state.apps.insert(
@@ -113,7 +113,7 @@ pub async fn spawn_app(broker: &Broker, app: App) -> Result<()> {
 pub async fn stop_app(broker: &Broker, name: &str) -> Result<()> {
     let mut state = broker.spawner.state.lock().await;
     let Some(managed) = state.apps.get_mut(name) else {
-        return Err(format!("app '{name}' not found").into());
+        return Err(Error::AppNotFound(name.to_string()));
     };
     if let Some(child) = managed.child.as_mut() {
         let _ = child.kill().await;
@@ -126,7 +126,7 @@ pub async fn stop_app(broker: &Broker, name: &str) -> Result<()> {
 pub async fn restart_app(broker: &Broker, name: &str) -> Result<()> {
     let mut state = broker.spawner.state.lock().await;
     let Some(managed) = state.apps.get_mut(name) else {
-        return Err(format!("app '{name}' not found").into());
+        return Err(Error::AppNotFound(name.to_string()));
     };
     if let Some(child) = managed.child.as_mut() {
         let _ = child.kill().await;
@@ -162,6 +162,10 @@ pub async fn app_statuses(broker: &Broker) -> Vec<(String, AppStatus)> {
     statuses
 }
 
+/// Drains buffered stdout/stderr lines from supervised apps. Output is held in
+/// a bounded buffer and is best-effort: if this is not called often enough,
+/// further lines are dropped once the buffer fills, so it is not a complete
+/// log. Call it on a regular interval to avoid loss.
 pub async fn drain_output(broker: &Broker) -> Vec<OutputLine> {
     let mut state = broker.spawner.state.lock().await;
     let mut lines = Vec::new();

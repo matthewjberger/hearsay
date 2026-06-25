@@ -1,8 +1,8 @@
 use crate::{
     BrokerContract, Message, Result,
-    bridge::{Bridge, BridgeCommand, ForwardPayload, connect_bridge, spawn_bridge},
+    bridge::{Bridge, BridgeCommand, BridgeRegistry, ForwardPayload, connect_bridge, spawn_bridge},
     contract::PeerEvent,
-    open_bridge,
+    open_bridge_acked,
     wire::{frame_payload, read_frame, serialize_payload},
 };
 #[cfg(feature = "websockets")]
@@ -10,7 +10,9 @@ use futures_util::SinkExt;
 use socket2::{Domain, Socket, TcpKeepalive, Type};
 use std::{
     collections::{BTreeSet, HashMap},
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     time::Duration,
 };
 use tokio::{
@@ -37,27 +39,56 @@ pub struct Broker {
     pub(crate) spawner: crate::spawn::Spawner,
 }
 
-pub(crate) enum PeerWriter {
-    Tcp(OwnedWriteHalf),
-    #[cfg(feature = "websockets")]
-    WebSocket(
-        futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<TcpStream>,
-            tokio_tungstenite::tungstenite::Message,
-        >,
-    ),
+pub(crate) type PeerWriter = Box<dyn PeerSink>;
+
+pub(crate) trait PeerSink: Send {
+    fn send_frame(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+pub(crate) struct TcpSink(pub(crate) OwnedWriteHalf);
+
+impl PeerSink for TcpSink {
+    fn send_frame(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.0.write_all(&frame_payload(&payload)).await?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(feature = "websockets")]
+pub(crate) struct WebSocketSink(
+    pub(crate)  futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<TcpStream>,
+        tokio_tungstenite::tungstenite::Message,
+    >,
+);
+
+#[cfg(feature = "websockets")]
+impl PeerSink for WebSocketSink {
+    fn send_frame(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.0
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    payload.into(),
+                ))
+                .await?;
+            Ok(())
+        })
+    }
 }
 
 async fn write_to_peer(writer: &mut PeerWriter, payload: Vec<u8>) -> Result<()> {
-    match writer {
-        PeerWriter::Tcp(write_half) => Ok(write_half.write_all(&frame_payload(&payload)).await?),
-        #[cfg(feature = "websockets")]
-        PeerWriter::WebSocket(sink) => Ok(sink
-            .send(tokio_tungstenite::tungstenite::Message::Binary(
-                payload.into(),
-            ))
-            .await?),
-    }
+    writer.send_frame(payload).await
 }
 
 pub async fn start_broker(address: &str) -> Result<Broker> {
@@ -121,7 +152,7 @@ struct BrokerState {
     peer_generations: HashMap<String, u64>,
     generation_counter: u64,
     subscriptions: HashMap<String, Vec<String>>,
-    bridges: Vec<Bridge>,
+    bridges: BridgeRegistry,
     disconnect_sender: UnboundedSender<(String, u64)>,
 }
 
@@ -166,7 +197,7 @@ async fn accept_loop(
 
 async fn connection_task(event_sender: Sender<BrokerEvent>, stream: TcpStream) {
     let (mut read_half, write_half) = stream.into_split();
-    let mut writer = Some(PeerWriter::Tcp(write_half));
+    let mut writer: Option<PeerWriter> = Some(Box::new(TcpSink(write_half)));
     let mut shutdown_signal = None;
     loop {
         let Ok(event) = read_frame::<PeerEvent>(&mut read_half).await else {
@@ -254,7 +285,7 @@ async fn broker_loop(
         peer_generations: HashMap::new(),
         generation_counter: 0,
         subscriptions: HashMap::new(),
-        bridges: Vec::new(),
+        bridges: BridgeRegistry::default(),
         disconnect_sender,
     };
     loop {
@@ -380,9 +411,9 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             ack,
         }) => {
             if ack {
-                close_local_bridge_by_id(state, &id);
+                state.bridges.close_by_id(&id);
             } else {
-                close_local_bridge_by_address(state, &target_address, true);
+                state.bridges.close_by_address(&target_address, true);
             }
         }
     }
@@ -534,11 +565,7 @@ fn answer_introspection_requests(state: &mut BrokerState, topic: &str) -> Result
         )?;
     } else if topic == BrokerContract::request_bridges_topic() {
         let (report_topic, mut payload) = BrokerContract::report_bridges();
-        payload.bridges = state
-            .bridges
-            .iter()
-            .map(|bridge| bridge.id.clone())
-            .collect();
+        payload.bridges = state.bridges.ids();
         publish_everywhere(
             state,
             BROKER_ID,
@@ -562,7 +589,7 @@ fn publish_everywhere(
     sequence: u64,
 ) -> Result<()> {
     if !local_only {
-        for bridge in &state.bridges {
+        for bridge in state.bridges.iter() {
             if bridge.id != publisher_id {
                 let _ = bridge.commands.try_send(BridgeCommand::Forward {
                     topic: topic.to_string(),
@@ -575,8 +602,7 @@ fn publish_everywhere(
     }
     let message = Message {
         topic: topic.to_string(),
-        payload,
-        bytes: None,
+        body: crate::Body::Text(payload),
     };
     deliver_to_subscribers(state, topic, &message)
 }
@@ -591,7 +617,7 @@ fn publish_bytes_everywhere(
     sequence: u64,
 ) -> Result<()> {
     if !local_only {
-        for bridge in &state.bridges {
+        for bridge in state.bridges.iter() {
             if bridge.id != publisher_id {
                 let _ = bridge.commands.try_send(BridgeCommand::Forward {
                     topic: topic.to_string(),
@@ -604,8 +630,7 @@ fn publish_bytes_everywhere(
     }
     let message = Message {
         topic: topic.to_string(),
-        payload: String::new(),
-        bytes: Some(payload),
+        body: crate::Body::Binary(payload),
     };
     deliver_to_subscribers(state, topic, &message)
 }
@@ -640,7 +665,7 @@ async fn open_broker_bridge(
     source_address: String,
     ack: bool,
 ) -> Result<()> {
-    close_local_bridge_by_address(state, &target_address, !ack);
+    state.bridges.close_by_address(&target_address, !ack);
     let override_id = if ack { Some(id.clone()) } else { None };
     let Some((client, bridge_id)) = connect_bridge(override_id, &target_address).await else {
         return Ok(());
@@ -662,44 +687,13 @@ async fn open_broker_bridge(
             sequence,
         )?;
     } else {
-        open_bridge(&client, &target_address, &source_address, true).await?;
+        open_bridge_acked(&client, &target_address, &source_address, true).await?;
     }
     let commands = spawn_bridge(client, bridge_id.clone(), target_address.clone());
-    state.bridges.push(Bridge {
+    state.bridges.insert(Bridge {
         id: bridge_id,
         target_address,
         commands,
     });
     Ok(())
-}
-
-fn close_local_bridge_by_address(
-    state: &mut BrokerState,
-    target_address: &str,
-    notify_remote: bool,
-) {
-    state.bridges.retain(|bridge| {
-        if bridge.target_address == target_address {
-            let command = if notify_remote {
-                BridgeCommand::CloseAndNotify
-            } else {
-                BridgeCommand::CloseLocal
-            };
-            let _ = bridge.commands.try_send(command);
-            false
-        } else {
-            true
-        }
-    });
-}
-
-fn close_local_bridge_by_id(state: &mut BrokerState, id: &str) {
-    state.bridges.retain(|bridge| {
-        if bridge.id == id {
-            let _ = bridge.commands.try_send(BridgeCommand::CloseLocal);
-            false
-        } else {
-            true
-        }
-    });
 }

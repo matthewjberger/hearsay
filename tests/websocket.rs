@@ -33,15 +33,15 @@ async fn websocket_and_tcp_peers_interoperate() -> hearsay::Result<()> {
     let broker = start_broker(broker_address).await?;
     start_websocket_listener(&broker, websocket_address).await?;
 
-    let mut tcp_client = create_client(
+    let tcp_client = create_client(
         "tcp_peer",
         ClientSettings {
             autoreconnect: false,
             ..Default::default()
         },
     );
-    connect(&mut tcp_client, broker_address).await?;
-    subscribe(&mut tcp_client, &["from/websocket"]).await?;
+    connect(&tcp_client, broker_address).await?;
+    subscribe(&tcp_client, &["from/websocket"]).await?;
 
     let (mut websocket, _response) =
         tokio_tungstenite::connect_async(format!("ws://{websocket_address}")).await?;
@@ -78,11 +78,11 @@ async fn websocket_and_tcp_peers_interoperate() -> hearsay::Result<()> {
     )
     .await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&mut tcp_client))
+    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&tcp_client))
         .await?
         .expect("expected a message from the websocket peer");
     assert_eq!(message.topic, "from/websocket");
-    let received: TestPayload = serde_json::from_str(&message.payload)?;
+    let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
     assert_eq!(received, payload);
 
     publish(&tcp_client, "from/tcp", &payload, Route::Global).await?;
@@ -102,7 +102,7 @@ async fn websocket_and_tcp_peers_interoperate() -> hearsay::Result<()> {
     })
     .await?;
     assert_eq!(message.topic, "from/tcp");
-    let received: TestPayload = serde_json::from_str(&message.payload)?;
+    let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
     assert_eq!(received, payload);
     Ok(())
 }
