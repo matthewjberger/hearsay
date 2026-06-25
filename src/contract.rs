@@ -66,6 +66,7 @@ pub enum PeerEvent {
         ack: bool,
     },
     CloseBridge {
+        id: String,
         target_address: String,
         ack: bool,
     },
@@ -75,6 +76,7 @@ pub enum PeerEvent {
         payload: String,
         local_only: bool,
         visited: Vec<String>,
+        sequence: u64,
     },
     ForwardBinary {
         id: String,
@@ -82,6 +84,7 @@ pub enum PeerEvent {
         payload: Vec<u8>,
         local_only: bool,
         visited: Vec<String>,
+        sequence: u64,
     },
 }
 

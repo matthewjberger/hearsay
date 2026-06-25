@@ -101,6 +101,12 @@ hearsay::flush_batch(&client, &mut batch).await?;            // or flush manuall
 let updates: Vec<EntityUpdate> = hearsay::read_batch(&message)?;
 ```
 
+## Delivery and backpressure
+
+Delivery is best-effort: there are no acknowledgements and no replay, so a message published while a subscriber is disconnected is gone. Each subscriber has two bounded queues at the broker: a control queue for the broker's own coordination messages (the `hearsay/` topics: peer connections, introspection reports, bridge events) and a data queue for everything else. High-frequency application data that outruns a subscriber is dropped from the data queue, the conventional best-effort behavior. Control messages are never silently dropped; if a subscriber is so stalled that even its low-volume control queue fills, the broker disconnects it, and with `autoreconnect` (the default) the client reconnects and re-subscribes rather than carrying a silent gap in coordination state.
+
+Across bridges, each message is forwarded with the set of brokers it has already traversed and a per-origin sequence number. A broker drops a message whose path already includes itself, which guarantees forwarding terminates on any topology including cycles. Each broker tracks a per-origin high-water mark, so a given message is delivered at most once no matter how many redundant paths carry it to that broker; the only state bounded for safety is the number of distinct origins tracked, evicted least-recently-seen first.
+
 ## Example
 
 `examples/pingpong.rs` exchanges a command and an event between two services using an enum contract. Run each role as its own process in separate terminals:

@@ -1,6 +1,6 @@
 use crate::{
-    Client, ClientSettings, assign_client_id, client_id, close_bridge, connect, create_client,
-    forward_bytes, forward_text, is_connected,
+    Client, ClientSettings, assign_client_id, client_id, connect, create_client, forward_bytes,
+    forward_text, is_connected, notify_close_bridge,
 };
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -18,6 +18,7 @@ pub(crate) enum BridgeCommand {
         topic: String,
         payload: ForwardPayload,
         visited: Vec<String>,
+        sequence: u64,
     },
     CloseAndNotify,
     CloseLocal,
@@ -49,26 +50,31 @@ pub(crate) async fn connect_bridge(
     Some((client, id))
 }
 
-pub(crate) fn spawn_bridge(client: Client, target_address: String) -> Sender<BridgeCommand> {
+pub(crate) fn spawn_bridge(
+    client: Client,
+    id: String,
+    target_address: String,
+) -> Sender<BridgeCommand> {
     let (sender, receiver) = channel(BRIDGE_QUEUE_CAPACITY);
-    tokio::spawn(bridge_task(client, receiver, target_address));
+    tokio::spawn(bridge_task(client, receiver, id, target_address));
     sender
 }
 
 async fn bridge_task(
     mut client: Client,
     mut commands: Receiver<BridgeCommand>,
+    id: String,
     target_address: String,
 ) {
     let mut reconnect = tokio::time::interval(BRIDGE_RECONNECT_INTERVAL);
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                Some(BridgeCommand::Forward { topic, payload, visited }) => {
-                    forward(&client, &topic, payload, visited).await;
+                Some(BridgeCommand::Forward { topic, payload, visited, sequence }) => {
+                    forward(&client, &topic, payload, visited, sequence).await;
                 }
                 Some(BridgeCommand::CloseAndNotify) => {
-                    let _ = close_bridge(&client, &target_address, true).await;
+                    let _ = notify_close_bridge(&client, &id).await;
                     break;
                 }
                 Some(BridgeCommand::CloseLocal) | None => break,
@@ -82,13 +88,19 @@ async fn bridge_task(
     }
 }
 
-async fn forward(client: &Client, topic: &str, payload: ForwardPayload, visited: Vec<String>) {
+async fn forward(
+    client: &Client,
+    topic: &str,
+    payload: ForwardPayload,
+    visited: Vec<String>,
+    sequence: u64,
+) {
     match payload {
         ForwardPayload::Text(text) => {
-            let _ = forward_text(client, topic, &text, visited).await;
+            let _ = forward_text(client, topic, &text, visited, sequence).await;
         }
         ForwardPayload::Binary(bytes) => {
-            let _ = forward_bytes(client, topic, &bytes, visited).await;
+            let _ = forward_bytes(client, topic, &bytes, visited, sequence).await;
         }
     }
 }

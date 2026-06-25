@@ -8,19 +8,27 @@ use crate::{
 #[cfg(feature = "websockets")]
 use futures_util::SinkExt;
 use socket2::{Domain, Socket, TcpKeepalive, Type};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::SocketAddr,
+    time::Duration,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
     sync::{
-        mpsc::{self, Receiver, Sender, UnboundedSender},
+        mpsc::{self, Receiver, Sender, UnboundedSender, error::TrySendError},
         oneshot, watch,
     },
 };
 
 const BROKER_ID: &str = "broker";
+const CONTROL_TOPIC_PREFIX: &str = "hearsay/";
 const BROKER_EVENT_CAPACITY: usize = 1024;
-const PEER_QUEUE_CAPACITY: usize = 1024;
+const CONTROL_QUEUE_CAPACITY: usize = 256;
+const DATA_QUEUE_CAPACITY: usize = 1024;
+const REORDER_WINDOW: usize = 1024;
+const MAX_TRACKED_ORIGINS: usize = 1024;
 
 pub struct Broker {
     pub(crate) sender: Sender<BrokerEvent>,
@@ -92,9 +100,24 @@ pub(crate) enum BrokerEvent {
     Peer(PeerEvent),
 }
 
+#[derive(Default)]
+struct OriginProgress {
+    watermark: u64,
+    ahead: BTreeSet<u64>,
+    last_seen: u64,
+}
+
+struct PeerChannels {
+    control: Sender<Vec<u8>>,
+    data: Sender<Vec<u8>>,
+}
+
 struct BrokerState {
     instance_id: String,
-    peers: HashMap<String, Sender<Vec<u8>>>,
+    publish_counter: u64,
+    origin_progress: HashMap<String, OriginProgress>,
+    origin_tick: u64,
+    peers: HashMap<String, PeerChannels>,
     peer_generations: HashMap<String, u64>,
     generation_counter: u64,
     subscriptions: HashMap<String, Vec<String>>,
@@ -183,7 +206,8 @@ pub(crate) async fn forward_peer_event(
 }
 
 async fn connection_writer_task(
-    mut messages: Receiver<Vec<u8>>,
+    mut control: Receiver<Vec<u8>>,
+    mut data: Receiver<Vec<u8>>,
     mut writer: PeerWriter,
     mut shutdown: oneshot::Receiver<()>,
     disconnect_sender: UnboundedSender<(String, u64)>,
@@ -192,7 +216,9 @@ async fn connection_writer_task(
 ) {
     loop {
         tokio::select! {
-            message = messages.recv() => match message {
+            biased;
+            _ = &mut shutdown => break,
+            message = control.recv() => match message {
                 Some(payload) => {
                     if write_to_peer(&mut writer, payload).await.is_err() {
                         break;
@@ -200,7 +226,14 @@ async fn connection_writer_task(
                 }
                 None => break,
             },
-            _ = &mut shutdown => break,
+            message = data.recv() => match message {
+                Some(payload) => {
+                    if write_to_peer(&mut writer, payload).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
         }
     }
     let _ = disconnect_sender.send((name, generation));
@@ -214,6 +247,9 @@ async fn broker_loop(
     let (disconnect_sender, mut disconnect_receiver) = mpsc::unbounded_channel();
     let mut state = BrokerState {
         instance_id,
+        publish_counter: 0,
+        origin_progress: HashMap::new(),
+        origin_tick: 0,
         peers: HashMap::new(),
         peer_generations: HashMap::new(),
         generation_counter: 0,
@@ -249,8 +285,17 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             establish_peer(state, &id, writer, shutdown);
             let (topic, mut payload) = BrokerContract::peer_connected();
             payload.id.clone_from(&id);
+            let sequence = next_sequence(state);
             let visited = origin_visited(state);
-            publish_everywhere(state, &id, &topic, payload.to_json()?, false, &visited)?;
+            publish_everywhere(
+                state,
+                &id,
+                &topic,
+                payload.to_json()?,
+                false,
+                &visited,
+                sequence,
+            )?;
         }
         BrokerEvent::Peer(PeerEvent::Hello { .. }) => {}
         BrokerEvent::Peer(PeerEvent::Subscribe { id, topic }) => {
@@ -266,8 +311,9 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             local_only,
         }) => {
             answer_introspection_requests(state, &topic)?;
+            let sequence = next_sequence(state);
             let visited = origin_visited(state);
-            publish_everywhere(state, &id, &topic, payload, local_only, &visited)?;
+            publish_everywhere(state, &id, &topic, payload, local_only, &visited, sequence)?;
         }
         BrokerEvent::Peer(PeerEvent::PublishBinary {
             id,
@@ -275,8 +321,9 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             payload,
             local_only,
         }) => {
+            let sequence = next_sequence(state);
             let visited = origin_visited(state);
-            publish_bytes_everywhere(state, &id, &topic, payload, local_only, &visited)?;
+            publish_bytes_everywhere(state, &id, &topic, payload, local_only, &visited, sequence)?;
         }
         BrokerEvent::Peer(PeerEvent::ForwardText {
             id,
@@ -284,13 +331,20 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             payload,
             local_only,
             visited,
+            sequence,
         }) => {
             if visited.iter().any(|seen| seen == &state.instance_id) {
                 return Ok(());
             }
+            let Some(origin) = visited.first().cloned() else {
+                return Ok(());
+            };
+            if !record_seen_message(state, &origin, sequence) {
+                return Ok(());
+            }
             answer_introspection_requests(state, &topic)?;
             let visited = extend_visited(visited, &state.instance_id);
-            publish_everywhere(state, &id, &topic, payload, local_only, &visited)?;
+            publish_everywhere(state, &id, &topic, payload, local_only, &visited, sequence)?;
         }
         BrokerEvent::Peer(PeerEvent::ForwardBinary {
             id,
@@ -298,12 +352,19 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             payload,
             local_only,
             visited,
+            sequence,
         }) => {
             if visited.iter().any(|seen| seen == &state.instance_id) {
                 return Ok(());
             }
+            let Some(origin) = visited.first().cloned() else {
+                return Ok(());
+            };
+            if !record_seen_message(state, &origin, sequence) {
+                return Ok(());
+            }
             let visited = extend_visited(visited, &state.instance_id);
-            publish_bytes_everywhere(state, &id, &topic, payload, local_only, &visited)?;
+            publish_bytes_everywhere(state, &id, &topic, payload, local_only, &visited, sequence)?;
         }
         BrokerEvent::Peer(PeerEvent::OpenBridge {
             id,
@@ -314,10 +375,15 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             open_broker_bridge(state, id, target_address, source_address, ack).await?;
         }
         BrokerEvent::Peer(PeerEvent::CloseBridge {
+            id,
             target_address,
             ack,
         }) => {
-            drop_bridge(state, &target_address, !ack);
+            if ack {
+                close_local_bridge_by_id(state, &id);
+            } else {
+                close_local_bridge_by_address(state, &target_address, true);
+            }
         }
     }
     Ok(())
@@ -334,6 +400,51 @@ fn extend_visited(mut visited: Vec<String>, instance_id: &str) -> Vec<String> {
     visited
 }
 
+fn next_sequence(state: &mut BrokerState) -> u64 {
+    state.publish_counter += 1;
+    state.publish_counter
+}
+
+fn record_seen_message(state: &mut BrokerState, origin: &str, sequence: u64) -> bool {
+    state.origin_tick += 1;
+    let tick = state.origin_tick;
+    if !state.origin_progress.contains_key(origin) {
+        if state.origin_progress.len() >= MAX_TRACKED_ORIGINS
+            && let Some(stalest) = state
+                .origin_progress
+                .iter()
+                .min_by_key(|(_, progress)| progress.last_seen)
+                .map(|(tracked, _)| tracked.clone())
+        {
+            state.origin_progress.remove(&stalest);
+        }
+        state
+            .origin_progress
+            .insert(origin.to_string(), OriginProgress::default());
+    }
+    let Some(progress) = state.origin_progress.get_mut(origin) else {
+        return true;
+    };
+    progress.last_seen = tick;
+    if sequence <= progress.watermark || !progress.ahead.insert(sequence) {
+        return false;
+    }
+    while progress.ahead.remove(&(progress.watermark + 1)) {
+        progress.watermark += 1;
+    }
+    while progress.ahead.len() > REORDER_WINDOW {
+        let Some(&smallest) = progress.ahead.iter().next() else {
+            break;
+        };
+        progress.ahead.remove(&smallest);
+        progress.watermark = smallest;
+        while progress.ahead.remove(&(progress.watermark + 1)) {
+            progress.watermark += 1;
+        }
+    }
+    true
+}
+
 fn establish_peer(
     state: &mut BrokerState,
     id: &str,
@@ -344,10 +455,18 @@ fn establish_peer(
     state.generation_counter += 1;
     let generation = state.generation_counter;
     state.peer_generations.insert(id.to_string(), generation);
-    let (message_sender, message_receiver) = mpsc::channel(PEER_QUEUE_CAPACITY);
-    state.peers.insert(id.to_string(), message_sender);
+    let (control_sender, control_receiver) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
+    let (data_sender, data_receiver) = mpsc::channel(DATA_QUEUE_CAPACITY);
+    state.peers.insert(
+        id.to_string(),
+        PeerChannels {
+            control: control_sender,
+            data: data_sender,
+        },
+    );
     tokio::spawn(connection_writer_task(
-        message_receiver,
+        control_receiver,
+        data_receiver,
         writer,
         shutdown,
         state.disconnect_sender.clone(),
@@ -380,8 +499,9 @@ fn unsubscribe_from_topic(subscriptions: &mut HashMap<String, Vec<String>>, id: 
     }
 }
 
-fn answer_introspection_requests(state: &BrokerState, topic: &str) -> Result<()> {
+fn answer_introspection_requests(state: &mut BrokerState, topic: &str) -> Result<()> {
     let visited = origin_visited(state);
+    let sequence = next_sequence(state);
     if topic == BrokerContract::request_subscriptions_topic() {
         let (report_topic, mut payload) = BrokerContract::report_subscriptions();
         payload.subscriptions = state
@@ -398,6 +518,7 @@ fn answer_introspection_requests(state: &BrokerState, topic: &str) -> Result<()>
             payload.to_json()?,
             false,
             &visited,
+            sequence,
         )?;
     } else if topic == BrokerContract::request_peers_topic() {
         let (report_topic, mut payload) = BrokerContract::report_peers();
@@ -409,6 +530,7 @@ fn answer_introspection_requests(state: &BrokerState, topic: &str) -> Result<()>
             payload.to_json()?,
             false,
             &visited,
+            sequence,
         )?;
     } else if topic == BrokerContract::request_bridges_topic() {
         let (report_topic, mut payload) = BrokerContract::report_bridges();
@@ -424,6 +546,7 @@ fn answer_introspection_requests(state: &BrokerState, topic: &str) -> Result<()>
             payload.to_json()?,
             false,
             &visited,
+            sequence,
         )?;
     }
     Ok(())
@@ -436,6 +559,7 @@ fn publish_everywhere(
     payload: String,
     local_only: bool,
     visited: &[String],
+    sequence: u64,
 ) -> Result<()> {
     if !local_only {
         for bridge in &state.bridges {
@@ -444,6 +568,7 @@ fn publish_everywhere(
                     topic: topic.to_string(),
                     payload: ForwardPayload::Text(payload.clone()),
                     visited: visited.to_vec(),
+                    sequence,
                 });
             }
         }
@@ -463,6 +588,7 @@ fn publish_bytes_everywhere(
     payload: Vec<u8>,
     local_only: bool,
     visited: &[String],
+    sequence: u64,
 ) -> Result<()> {
     if !local_only {
         for bridge in &state.bridges {
@@ -471,6 +597,7 @@ fn publish_bytes_everywhere(
                     topic: topic.to_string(),
                     payload: ForwardPayload::Binary(payload.clone()),
                     visited: visited.to_vec(),
+                    sequence,
                 });
             }
         }
@@ -488,9 +615,19 @@ fn deliver_to_subscribers(state: &BrokerState, topic: &str, message: &Message) -
         return Ok(());
     };
     let payload_bytes = serialize_payload(message)?;
+    let control = topic.starts_with(CONTROL_TOPIC_PREFIX);
     for subscriber in subscribers {
-        if let Some(peer) = state.peers.get(subscriber) {
-            let _ = peer.try_send(payload_bytes.clone());
+        let Some(peer) = state.peers.get(subscriber) else {
+            continue;
+        };
+        let queue = if control { &peer.control } else { &peer.data };
+        if let Err(TrySendError::Full(_)) = queue.try_send(payload_bytes.clone())
+            && control
+            && let Some(generation) = state.peer_generations.get(subscriber).copied()
+        {
+            let _ = state
+                .disconnect_sender
+                .send((subscriber.clone(), generation));
         }
     }
     Ok(())
@@ -503,7 +640,7 @@ async fn open_broker_bridge(
     source_address: String,
     ack: bool,
 ) -> Result<()> {
-    drop_bridge(state, &target_address, !ack);
+    close_local_bridge_by_address(state, &target_address, !ack);
     let override_id = if ack { Some(id.clone()) } else { None };
     let Some((client, bridge_id)) = connect_bridge(override_id, &target_address).await else {
         return Ok(());
@@ -513,12 +650,21 @@ async fn open_broker_bridge(
         payload.id.clone_from(&bridge_id);
         payload.source_address = source_address;
         payload.target_address = target_address.clone();
+        let sequence = next_sequence(state);
         let visited = origin_visited(state);
-        publish_everywhere(state, &id, &topic, payload.to_json()?, false, &visited)?;
+        publish_everywhere(
+            state,
+            &id,
+            &topic,
+            payload.to_json()?,
+            false,
+            &visited,
+            sequence,
+        )?;
     } else {
         open_bridge(&client, &target_address, &source_address, true).await?;
     }
-    let commands = spawn_bridge(client, target_address.clone());
+    let commands = spawn_bridge(client, bridge_id.clone(), target_address.clone());
     state.bridges.push(Bridge {
         id: bridge_id,
         target_address,
@@ -527,7 +673,11 @@ async fn open_broker_bridge(
     Ok(())
 }
 
-fn drop_bridge(state: &mut BrokerState, target_address: &str, notify_remote: bool) {
+fn close_local_bridge_by_address(
+    state: &mut BrokerState,
+    target_address: &str,
+    notify_remote: bool,
+) {
     state.bridges.retain(|bridge| {
         if bridge.target_address == target_address {
             let command = if notify_remote {
@@ -536,6 +686,17 @@ fn drop_bridge(state: &mut BrokerState, target_address: &str, notify_remote: boo
                 BridgeCommand::CloseLocal
             };
             let _ = bridge.commands.try_send(command);
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn close_local_bridge_by_id(state: &mut BrokerState, id: &str) {
+    state.bridges.retain(|bridge| {
+        if bridge.id == id {
+            let _ = bridge.commands.try_send(BridgeCommand::CloseLocal);
             false
         } else {
             true

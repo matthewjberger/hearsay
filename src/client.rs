@@ -29,6 +29,10 @@ type ReceiverSlot = Arc<Mutex<Option<UnboundedReceiver<Message>>>>;
 
 #[derive(Debug, Clone)]
 pub struct ClientSettings {
+    /// Number of additional connection attempts after the first failure before
+    /// [`connect`] gives up. `Some(0)` makes a single attempt; `Some(n)` retries
+    /// up to `n` more times; `None` retries forever, so `connect` will not return
+    /// until a broker is reachable.
     pub max_connection_attempts: Option<u16>,
     pub autoreconnect: bool,
     pub timeout_per_attempt: Duration,
@@ -171,6 +175,7 @@ pub(crate) async fn forward_text(
     topic: &str,
     payload: &str,
     visited: Vec<String>,
+    sequence: u64,
 ) -> Result<()> {
     let mut state = client.state.write().await;
     let forward_event = PeerEvent::ForwardText {
@@ -179,6 +184,7 @@ pub(crate) async fn forward_text(
         payload: payload.to_string(),
         local_only: false,
         visited,
+        sequence,
     };
     notify_broker(&mut state, &forward_event).await
 }
@@ -188,6 +194,7 @@ pub(crate) async fn forward_bytes(
     topic: &str,
     payload: &[u8],
     visited: Vec<String>,
+    sequence: u64,
 ) -> Result<()> {
     let mut state = client.state.write().await;
     let forward_event = PeerEvent::ForwardBinary {
@@ -196,6 +203,7 @@ pub(crate) async fn forward_bytes(
         payload: payload.to_vec(),
         local_only: false,
         visited,
+        sequence,
     };
     notify_broker(&mut state, &forward_event).await
 }
@@ -283,8 +291,19 @@ pub async fn open_bridge(
 pub async fn close_bridge(client: &Client, target_address: &str, ack: bool) -> Result<()> {
     let mut state = client.state.write().await;
     let close_event = PeerEvent::CloseBridge {
+        id: String::new(),
         target_address: target_address.to_string(),
         ack,
+    };
+    notify_broker(&mut state, &close_event).await
+}
+
+pub(crate) async fn notify_close_bridge(client: &Client, id: &str) -> Result<()> {
+    let mut state = client.state.write().await;
+    let close_event = PeerEvent::CloseBridge {
+        id: id.to_string(),
+        target_address: String::new(),
+        ack: true,
     };
     notify_broker(&mut state, &close_event).await
 }
