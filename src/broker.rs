@@ -1,9 +1,8 @@
 use crate::{
-    BrokerContract, Message, Result, Route,
-    bridge::{Bridge, bridge_is_connected, connect_bridge, create_bridge},
-    close_bridge,
+    BrokerContract, Message, Result,
+    bridge::{Bridge, BridgeCommand, ForwardPayload, connect_bridge, spawn_bridge},
     contract::PeerEvent,
-    open_bridge, publish_bytes, publish_json,
+    open_bridge,
     wire::{frame_payload, read_frame, serialize_payload},
 };
 #[cfg(feature = "websockets")]
@@ -14,16 +13,17 @@ use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
     sync::{
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        mpsc::{self, Receiver, Sender, UnboundedSender},
         oneshot, watch,
     },
 };
 
 const BROKER_ID: &str = "broker";
-const BRIDGE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
+const BROKER_EVENT_CAPACITY: usize = 1024;
+const PEER_QUEUE_CAPACITY: usize = 1024;
 
 pub struct Broker {
-    pub(crate) sender: UnboundedSender<BrokerEvent>,
+    pub(crate) sender: Sender<BrokerEvent>,
     pub(crate) shutdown_sender: watch::Sender<bool>,
     #[cfg(feature = "spawn")]
     pub(crate) spawner: crate::spawn::Spawner,
@@ -54,9 +54,14 @@ async fn write_to_peer(writer: &mut PeerWriter, payload: Vec<u8>) -> Result<()> 
 
 pub async fn start_broker(address: &str) -> Result<Broker> {
     let listener = create_listener(resolve_address(address).await?)?;
-    let (event_sender, event_receiver) = mpsc::unbounded_channel();
+    let (event_sender, event_receiver) = mpsc::channel(BROKER_EVENT_CAPACITY);
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    tokio::spawn(broker_loop(event_receiver, shutdown_receiver.clone()));
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    tokio::spawn(broker_loop(
+        event_receiver,
+        shutdown_receiver.clone(),
+        instance_id,
+    ));
     tokio::spawn(accept_loop(
         listener,
         event_sender.clone(),
@@ -88,7 +93,8 @@ pub(crate) enum BrokerEvent {
 }
 
 struct BrokerState {
-    peers: HashMap<String, UnboundedSender<Vec<u8>>>,
+    instance_id: String,
+    peers: HashMap<String, Sender<Vec<u8>>>,
     peer_generations: HashMap<String, u64>,
     generation_counter: u64,
     subscriptions: HashMap<String, Vec<String>>,
@@ -119,7 +125,7 @@ fn create_listener(socket_address: SocketAddr) -> Result<TcpListener> {
 
 async fn accept_loop(
     listener: TcpListener,
-    event_sender: UnboundedSender<BrokerEvent>,
+    event_sender: Sender<BrokerEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -135,7 +141,7 @@ async fn accept_loop(
     }
 }
 
-async fn connection_task(event_sender: UnboundedSender<BrokerEvent>, stream: TcpStream) {
+async fn connection_task(event_sender: Sender<BrokerEvent>, stream: TcpStream) {
     let (mut read_half, write_half) = stream.into_split();
     let mut writer = Some(PeerWriter::Tcp(write_half));
     let mut shutdown_signal = None;
@@ -143,16 +149,16 @@ async fn connection_task(event_sender: UnboundedSender<BrokerEvent>, stream: Tcp
         let Ok(event) = read_frame::<PeerEvent>(&mut read_half).await else {
             break;
         };
-        if !forward_peer_event(event, &event_sender, &mut writer, &mut shutdown_signal) {
+        if !forward_peer_event(event, &event_sender, &mut writer, &mut shutdown_signal).await {
             break;
         }
     }
     drop(shutdown_signal);
 }
 
-pub(crate) fn forward_peer_event(
+pub(crate) async fn forward_peer_event(
     event: PeerEvent,
-    event_sender: &UnboundedSender<BrokerEvent>,
+    event_sender: &Sender<BrokerEvent>,
     writer: &mut Option<PeerWriter>,
     shutdown_signal: &mut Option<oneshot::Sender<()>>,
 ) -> bool {
@@ -161,21 +167,23 @@ pub(crate) fn forward_peer_event(
             Some(peer_writer) => {
                 let (shutdown_sender, shutdown_receiver) = oneshot::channel();
                 *shutdown_signal = Some(shutdown_sender);
-                event_sender.send(BrokerEvent::Hello {
-                    id,
-                    writer: peer_writer,
-                    shutdown: shutdown_receiver,
-                })
+                event_sender
+                    .send(BrokerEvent::Hello {
+                        id,
+                        writer: peer_writer,
+                        shutdown: shutdown_receiver,
+                    })
+                    .await
             }
             None => Ok(()),
         },
-        event => event_sender.send(BrokerEvent::Peer(event)),
+        event => event_sender.send(BrokerEvent::Peer(event)).await,
     };
     forwarded.is_ok()
 }
 
 async fn connection_writer_task(
-    mut messages: UnboundedReceiver<Vec<u8>>,
+    mut messages: Receiver<Vec<u8>>,
     mut writer: PeerWriter,
     mut shutdown: oneshot::Receiver<()>,
     disconnect_sender: UnboundedSender<(String, u64)>,
@@ -199,11 +207,13 @@ async fn connection_writer_task(
 }
 
 async fn broker_loop(
-    mut events: UnboundedReceiver<BrokerEvent>,
+    mut events: Receiver<BrokerEvent>,
     mut shutdown: watch::Receiver<bool>,
+    instance_id: String,
 ) {
     let (disconnect_sender, mut disconnect_receiver) = mpsc::unbounded_channel();
     let mut state = BrokerState {
+        instance_id,
         peers: HashMap::new(),
         peer_generations: HashMap::new(),
         generation_counter: 0,
@@ -211,7 +221,6 @@ async fn broker_loop(
         bridges: Vec::new(),
         disconnect_sender,
     };
-    let mut bridge_maintenance = tokio::time::interval(BRIDGE_MAINTENANCE_INTERVAL);
     loop {
         tokio::select! {
             event = events.recv() => match event {
@@ -224,9 +233,6 @@ async fn broker_loop(
                 if let Some((name, generation)) = disconnect {
                     remove_disconnected_peer(&mut state, &name, generation);
                 }
-            },
-            _ = bridge_maintenance.tick() => {
-                reconnect_broken_bridges(&mut state.bridges).await;
             },
             _ = shutdown.changed() => break,
         }
@@ -243,7 +249,8 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             establish_peer(state, &id, writer, shutdown);
             let (topic, mut payload) = BrokerContract::peer_connected();
             payload.id.clone_from(&id);
-            publish_everywhere(state, &id, &topic, payload.to_json()?, false).await?;
+            let visited = origin_visited(state);
+            publish_everywhere(state, &id, &topic, payload.to_json()?, false, &visited)?;
         }
         BrokerEvent::Peer(PeerEvent::Hello { .. }) => {}
         BrokerEvent::Peer(PeerEvent::Subscribe { id, topic }) => {
@@ -258,8 +265,9 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             payload,
             local_only,
         }) => {
-            answer_introspection_requests(state, &topic).await?;
-            publish_everywhere(state, &id, &topic, payload, local_only).await?;
+            answer_introspection_requests(state, &topic)?;
+            let visited = origin_visited(state);
+            publish_everywhere(state, &id, &topic, payload, local_only, &visited)?;
         }
         BrokerEvent::Peer(PeerEvent::PublishBinary {
             id,
@@ -267,7 +275,35 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             payload,
             local_only,
         }) => {
-            publish_bytes_everywhere(state, &id, &topic, payload, local_only).await?;
+            let visited = origin_visited(state);
+            publish_bytes_everywhere(state, &id, &topic, payload, local_only, &visited)?;
+        }
+        BrokerEvent::Peer(PeerEvent::ForwardText {
+            id,
+            topic,
+            payload,
+            local_only,
+            visited,
+        }) => {
+            if visited.iter().any(|seen| seen == &state.instance_id) {
+                return Ok(());
+            }
+            answer_introspection_requests(state, &topic)?;
+            let visited = extend_visited(visited, &state.instance_id);
+            publish_everywhere(state, &id, &topic, payload, local_only, &visited)?;
+        }
+        BrokerEvent::Peer(PeerEvent::ForwardBinary {
+            id,
+            topic,
+            payload,
+            local_only,
+            visited,
+        }) => {
+            if visited.iter().any(|seen| seen == &state.instance_id) {
+                return Ok(());
+            }
+            let visited = extend_visited(visited, &state.instance_id);
+            publish_bytes_everywhere(state, &id, &topic, payload, local_only, &visited)?;
         }
         BrokerEvent::Peer(PeerEvent::OpenBridge {
             id,
@@ -281,10 +317,21 @@ async fn handle_broker_event(state: &mut BrokerState, event: BrokerEvent) -> Res
             target_address,
             ack,
         }) => {
-            close_broker_bridge(state, &target_address, ack).await;
+            drop_bridge(state, &target_address, !ack);
         }
     }
     Ok(())
+}
+
+fn origin_visited(state: &BrokerState) -> Vec<String> {
+    vec![state.instance_id.clone()]
+}
+
+fn extend_visited(mut visited: Vec<String>, instance_id: &str) -> Vec<String> {
+    if !visited.iter().any(|entry| entry == instance_id) {
+        visited.push(instance_id.to_string());
+    }
+    visited
 }
 
 fn establish_peer(
@@ -297,7 +344,7 @@ fn establish_peer(
     state.generation_counter += 1;
     let generation = state.generation_counter;
     state.peer_generations.insert(id.to_string(), generation);
-    let (message_sender, message_receiver) = mpsc::unbounded_channel();
+    let (message_sender, message_receiver) = mpsc::channel(PEER_QUEUE_CAPACITY);
     state.peers.insert(id.to_string(), message_sender);
     tokio::spawn(connection_writer_task(
         message_receiver,
@@ -333,7 +380,8 @@ fn unsubscribe_from_topic(subscriptions: &mut HashMap<String, Vec<String>>, id: 
     }
 }
 
-async fn answer_introspection_requests(state: &BrokerState, topic: &str) -> Result<()> {
+fn answer_introspection_requests(state: &BrokerState, topic: &str) -> Result<()> {
+    let visited = origin_visited(state);
     if topic == BrokerContract::request_subscriptions_topic() {
         let (report_topic, mut payload) = BrokerContract::report_subscriptions();
         payload.subscriptions = state
@@ -343,11 +391,25 @@ async fn answer_introspection_requests(state: &BrokerState, topic: &str) -> Resu
                 (subscription_topic.clone(), subscribers.clone())
             })
             .collect();
-        publish_everywhere(state, BROKER_ID, &report_topic, payload.to_json()?, false).await?;
+        publish_everywhere(
+            state,
+            BROKER_ID,
+            &report_topic,
+            payload.to_json()?,
+            false,
+            &visited,
+        )?;
     } else if topic == BrokerContract::request_peers_topic() {
         let (report_topic, mut payload) = BrokerContract::report_peers();
         payload.peers = state.peers.keys().cloned().collect();
-        publish_everywhere(state, BROKER_ID, &report_topic, payload.to_json()?, false).await?;
+        publish_everywhere(
+            state,
+            BROKER_ID,
+            &report_topic,
+            payload.to_json()?,
+            false,
+            &visited,
+        )?;
     } else if topic == BrokerContract::request_bridges_topic() {
         let (report_topic, mut payload) = BrokerContract::report_bridges();
         payload.bridges = state
@@ -355,22 +417,34 @@ async fn answer_introspection_requests(state: &BrokerState, topic: &str) -> Resu
             .iter()
             .map(|bridge| bridge.id.clone())
             .collect();
-        publish_everywhere(state, BROKER_ID, &report_topic, payload.to_json()?, false).await?;
+        publish_everywhere(
+            state,
+            BROKER_ID,
+            &report_topic,
+            payload.to_json()?,
+            false,
+            &visited,
+        )?;
     }
     Ok(())
 }
 
-async fn publish_everywhere(
+fn publish_everywhere(
     state: &BrokerState,
     publisher_id: &str,
     topic: &str,
     payload: String,
     local_only: bool,
+    visited: &[String],
 ) -> Result<()> {
     if !local_only {
         for bridge in &state.bridges {
             if bridge.id != publisher_id {
-                let _ = publish_json(&bridge.client, topic, &payload, Route::Global).await;
+                let _ = bridge.commands.try_send(BridgeCommand::Forward {
+                    topic: topic.to_string(),
+                    payload: ForwardPayload::Text(payload.clone()),
+                    visited: visited.to_vec(),
+                });
             }
         }
     }
@@ -382,17 +456,22 @@ async fn publish_everywhere(
     deliver_to_subscribers(state, topic, &message)
 }
 
-async fn publish_bytes_everywhere(
+fn publish_bytes_everywhere(
     state: &BrokerState,
     publisher_id: &str,
     topic: &str,
     payload: Vec<u8>,
     local_only: bool,
+    visited: &[String],
 ) -> Result<()> {
     if !local_only {
         for bridge in &state.bridges {
             if bridge.id != publisher_id {
-                let _ = publish_bytes(&bridge.client, topic, &payload, Route::Global).await;
+                let _ = bridge.commands.try_send(BridgeCommand::Forward {
+                    topic: topic.to_string(),
+                    payload: ForwardPayload::Binary(payload.clone()),
+                    visited: visited.to_vec(),
+                });
             }
         }
     }
@@ -411,7 +490,7 @@ fn deliver_to_subscribers(state: &BrokerState, topic: &str, message: &Message) -
     let payload_bytes = serialize_payload(message)?;
     for subscriber in subscribers {
         if let Some(peer) = state.peers.get(subscriber) {
-            let _ = peer.send(payload_bytes.clone());
+            let _ = peer.try_send(payload_bytes.clone());
         }
     }
     Ok(())
@@ -424,56 +503,42 @@ async fn open_broker_bridge(
     source_address: String,
     ack: bool,
 ) -> Result<()> {
-    prune_duplicate_bridge(&mut state.bridges, &target_address, ack).await;
+    drop_bridge(state, &target_address, !ack);
     let override_id = if ack { Some(id.clone()) } else { None };
-    let mut bridge = create_bridge(override_id, &target_address).await;
-    if connect_bridge(&mut bridge).await.is_err() {
+    let Some((client, bridge_id)) = connect_bridge(override_id, &target_address).await else {
         return Ok(());
-    }
+    };
     if ack {
         let (topic, mut payload) = BrokerContract::bridge_created();
-        payload.id.clone_from(&bridge.id);
+        payload.id.clone_from(&bridge_id);
         payload.source_address = source_address;
-        payload.target_address = target_address;
-        publish_everywhere(state, &id, &topic, payload.to_json()?, false).await?;
+        payload.target_address = target_address.clone();
+        let visited = origin_visited(state);
+        publish_everywhere(state, &id, &topic, payload.to_json()?, false, &visited)?;
     } else {
-        open_bridge(&bridge.client, &target_address, &source_address, true).await?;
+        open_bridge(&client, &target_address, &source_address, true).await?;
     }
-    state.bridges.push(bridge);
+    let commands = spawn_bridge(client, target_address.clone());
+    state.bridges.push(Bridge {
+        id: bridge_id,
+        target_address,
+        commands,
+    });
     Ok(())
 }
 
-async fn close_broker_bridge(state: &mut BrokerState, target_address: &str, ack: bool) {
-    if let Some(bridge) = state
-        .bridges
-        .iter()
-        .find(|bridge| bridge.target_address == target_address)
-    {
-        if !ack {
-            let _ = close_bridge(&bridge.client, target_address, true).await;
+fn drop_bridge(state: &mut BrokerState, target_address: &str, notify_remote: bool) {
+    state.bridges.retain(|bridge| {
+        if bridge.target_address == target_address {
+            let command = if notify_remote {
+                BridgeCommand::CloseAndNotify
+            } else {
+                BridgeCommand::CloseLocal
+            };
+            let _ = bridge.commands.try_send(command);
+            false
+        } else {
+            true
         }
-        state
-            .bridges
-            .retain(|bridge| bridge.target_address != target_address);
-    }
-}
-
-async fn prune_duplicate_bridge(bridges: &mut Vec<Bridge>, target_address: &str, ack: bool) {
-    if let Some(bridge) = bridges
-        .iter()
-        .find(|bridge| bridge.target_address == target_address)
-    {
-        if !ack && bridge_is_connected(bridge).await {
-            let _ = close_bridge(&bridge.client, target_address, true).await;
-        }
-        bridges.retain(|bridge| bridge.target_address != target_address);
-    }
-}
-
-async fn reconnect_broken_bridges(bridges: &mut [Bridge]) {
-    for bridge in bridges.iter_mut() {
-        if !bridge_is_connected(bridge).await {
-            let _ = connect_bridge(bridge).await;
-        }
-    }
+    });
 }

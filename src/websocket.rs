@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{mpsc::UnboundedSender, watch},
+    sync::{mpsc::Sender, watch},
 };
 use tokio_tungstenite::tungstenite;
 
@@ -23,7 +23,7 @@ pub async fn start_websocket_listener(broker: &Broker, address: &str) -> Result<
 
 async fn websocket_accept_loop(
     listener: TcpListener,
-    event_sender: UnboundedSender<BrokerEvent>,
+    event_sender: Sender<BrokerEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -39,7 +39,7 @@ async fn websocket_accept_loop(
     }
 }
 
-async fn websocket_connection_task(event_sender: UnboundedSender<BrokerEvent>, stream: TcpStream) {
+async fn websocket_connection_task(event_sender: Sender<BrokerEvent>, stream: TcpStream) {
     let Ok(websocket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
@@ -55,7 +55,7 @@ async fn websocket_connection_task(event_sender: UnboundedSender<BrokerEvent>, s
             tungstenite::Message::Close(_) => break,
             _ => continue,
         };
-        if !forward_peer_event(event, &event_sender, &mut writer, &mut shutdown_signal) {
+        if !forward_peer_event(event, &event_sender, &mut writer, &mut shutdown_signal).await {
             break;
         }
     }

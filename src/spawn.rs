@@ -10,13 +10,14 @@ use tokio::{
     process::{Child, Command},
     sync::{
         Mutex,
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        mpsc::{self, Receiver, Sender, error::TrySendError},
     },
 };
 
 pub const BROKER_ADDRESS_VARIABLE: &str = "HEARSAY_BROKER";
 
 const SUPERVISION_INTERVAL: Duration = Duration::from_millis(500);
+const OUTPUT_CAPACITY: usize = 4096;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -68,8 +69,8 @@ pub(crate) struct Spawner {
 struct SpawnerState {
     broker_address: String,
     apps: HashMap<String, ManagedApp>,
-    output_sender: UnboundedSender<OutputLine>,
-    output_receiver: UnboundedReceiver<OutputLine>,
+    output_sender: Sender<OutputLine>,
+    output_receiver: Receiver<OutputLine>,
 }
 
 struct ManagedApp {
@@ -79,7 +80,7 @@ struct ManagedApp {
 }
 
 pub(crate) fn create_spawner(broker_address: &str) -> Spawner {
-    let (output_sender, output_receiver) = mpsc::unbounded_channel();
+    let (output_sender, output_receiver) = mpsc::channel(OUTPUT_CAPACITY);
     let state = Arc::new(Mutex::new(SpawnerState {
         broker_address: broker_address.to_string(),
         apps: HashMap::new(),
@@ -170,15 +171,9 @@ pub async fn drain_output(broker: &Broker) -> Vec<OutputLine> {
     lines
 }
 
-fn launch(
-    app: &App,
-    broker_address: &str,
-    output_sender: &UnboundedSender<OutputLine>,
-) -> Result<Child> {
+fn launch(app: &App, broker_address: &str, output_sender: &Sender<OutputLine>) -> Result<Child> {
     let mut command = Command::new(&app.path);
-    if !app.args.is_empty() {
-        command.args(app.args.split_whitespace());
-    }
+    command.args(split_arguments(&app.args));
     command.envs(&app.environment_variables);
     command.env(BROKER_ADDRESS_VARIABLE, broker_address);
     command.stdout(Stdio::piped());
@@ -210,7 +205,7 @@ async fn read_output(
     stream: impl AsyncRead + Unpin + Send + 'static,
     app_name: String,
     output_stream: OutputStream,
-    sender: UnboundedSender<OutputLine>,
+    sender: Sender<OutputLine>,
 ) {
     let mut lines = BufReader::new(stream).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -223,10 +218,45 @@ async fn read_output(
             line,
             timestamp_ms,
         };
-        if sender.send(output_line).is_err() {
-            break;
+        match sender.try_send(output_line) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Closed(_)) => break,
         }
     }
+}
+
+fn split_arguments(input: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut has_token = false;
+    for character in input.chars() {
+        match character {
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                has_token = true;
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                has_token = true;
+            }
+            character if character.is_whitespace() && !in_single_quote && !in_double_quote => {
+                if has_token {
+                    arguments.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            character => {
+                current.push(character);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        arguments.push(current);
+    }
+    arguments
 }
 
 fn poll_status(managed: &mut ManagedApp) -> AppStatus {

@@ -166,6 +166,40 @@ pub async fn publish_bytes(
     notify_broker(&mut state, &publish_event).await
 }
 
+pub(crate) async fn forward_text(
+    client: &Client,
+    topic: &str,
+    payload: &str,
+    visited: Vec<String>,
+) -> Result<()> {
+    let mut state = client.state.write().await;
+    let forward_event = PeerEvent::ForwardText {
+        id: state.id.clone(),
+        topic: topic.to_string(),
+        payload: payload.to_string(),
+        local_only: false,
+        visited,
+    };
+    notify_broker(&mut state, &forward_event).await
+}
+
+pub(crate) async fn forward_bytes(
+    client: &Client,
+    topic: &str,
+    payload: &[u8],
+    visited: Vec<String>,
+) -> Result<()> {
+    let mut state = client.state.write().await;
+    let forward_event = PeerEvent::ForwardBinary {
+        id: state.id.clone(),
+        topic: topic.to_string(),
+        payload: payload.to_vec(),
+        local_only: false,
+        visited,
+    };
+    notify_broker(&mut state, &forward_event).await
+}
+
 pub async fn subscribe(client: &mut Client, topics: &[&str]) -> Result<()> {
     let mut state = client.state.write().await;
     for topic in topics {
@@ -322,12 +356,10 @@ async fn connect_with_retries(
         {
             return Ok(stream);
         }
-        match max_connection_attempts {
-            Some(max_attempts) if attempt >= max_attempts => {
-                return Err("maximum connection attempts reached".into());
-            }
-            Some(_) => {}
-            None => return Err("connection attempt failed".into()),
+        if let Some(max_attempts) = max_connection_attempts
+            && attempt >= max_attempts
+        {
+            return Err("maximum connection attempts reached".into());
         }
         attempt += 1;
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -398,7 +430,7 @@ async fn read_task(
 async fn notify_broker(state: &mut ClientState, event: &PeerEvent) -> Result<()> {
     let frame = frame_payload(&serialize_payload(event)?);
     let Some(writer) = state.writer.as_mut() else {
-        return Ok(());
+        return Err("client is not connected".into());
     };
     if let Err(error) = writer.write_all(&frame).await {
         state.writer = None;

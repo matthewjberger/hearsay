@@ -69,6 +69,20 @@ pub enum PeerEvent {
         target_address: String,
         ack: bool,
     },
+    ForwardText {
+        id: String,
+        topic: String,
+        payload: String,
+        local_only: bool,
+        visited: Vec<String>,
+    },
+    ForwardBinary {
+        id: String,
+        topic: String,
+        payload: Vec<u8>,
+        local_only: bool,
+        visited: Vec<String>,
+    },
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone)]
