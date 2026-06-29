@@ -1,6 +1,6 @@
 ﻿[package]
 name = "hearsay"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Matthew Berger <matthewjordanberger@gmail.com>"]
 description = """
 A message broker and client for topic-based pub/sub messaging over TCP, built on tokio, with broker bridging, websockets, process spawning, and strongly typed enum contracts.
@@ -33,7 +33,14 @@ futures-util = { version = "0.3", default-features = false, features = [
 ], optional = true }
 serde_json = "1.0"
 socket2 = { version = "0.5", features = ["all"] }
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
 tokio-tungstenite = { version = "0.26", optional = true }
 uuid = { version = "1", features = ["v4"] }
 
