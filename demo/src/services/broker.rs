@@ -161,8 +161,8 @@ async fn broker_runtime_loop(
         WindowRole::Child { broker_address } => (None, broker_address),
     };
 
-    let mut client = hearsay::create_client("window", hearsay::ClientSettings::default());
-    if let Err(error) = hearsay::connect(&mut client, &address).await {
+    let client = hearsay::create_client("window", hearsay::ClientSettings::default());
+    if let Err(error) = hearsay::connect(&client, &address).await {
         let _ = event_sender.send(RuntimeEvent::Failed {
             reason: error.to_string(),
         });
@@ -181,16 +181,20 @@ async fn broker_runtime_loop(
             tokio::select! {
                 command = command_receiver.recv() => match command {
                     Some(command) => {
-                        execute_runtime_command(command, &broker, &mut client, &mut window_counter).await;
+                        execute_runtime_command(command, &broker, &client, &mut window_counter).await;
                     }
                     None => break,
                 },
-                inbound = hearsay::next_message(&mut client) => match inbound {
+                inbound = hearsay::next_message(&client) => match inbound {
                     Some(message) => {
+                        let (payload, bytes) = match message.body {
+                            hearsay::Body::Text(text) => (text, None),
+                            hearsay::Body::Binary(bytes) => (String::new(), Some(bytes)),
+                        };
                         let _ = event_sender.send(RuntimeEvent::Inbound {
                             topic: message.topic,
-                            payload: message.payload,
-                            bytes: message.bytes,
+                            payload,
+                            bytes,
                         });
                     }
                     None => {
@@ -203,7 +207,7 @@ async fn broker_runtime_loop(
             tokio::select! {
                 command = command_receiver.recv() => match command {
                     Some(command) => {
-                        execute_runtime_command(command, &broker, &mut client, &mut window_counter).await;
+                        execute_runtime_command(command, &broker, &client, &mut window_counter).await;
                     }
                     None => break,
                 },
@@ -225,7 +229,7 @@ async fn broker_runtime_loop(
 async fn execute_runtime_command(
     command: RuntimeCommand,
     broker: &Option<hearsay::Broker>,
-    client: &mut hearsay::Client,
+    client: &hearsay::Client,
     window_counter: &mut u32,
 ) {
     match command {
