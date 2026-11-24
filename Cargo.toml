@@ -6,7 +6,7 @@ description = """
 A message broker and client for topic-based pub/sub messaging over TCP, built on tokio, with broker bridging, websockets, process spawning, and strongly typed enum contracts.
 """
 homepage = "https://github.com/matthewjberger/hearsay"
-repository = "https://github.com/matthewjberger/hearsay"
+repository = "https://github.com/matthewjberger/hearsay/tree/main"
 keywords = ["pubsub", "broker", "messaging", "tokio", "ipc"]
 categories = ["network-programming", "asynchronous", "wasm"]
 license = "MIT OR Apache-2.0"
